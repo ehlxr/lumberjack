@@ -3,12 +3,11 @@
 package lumberjack_test
 
 import (
+	"github.com/ehlxr/lumberjack"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Example of how to rotate in response to SIGHUP.
