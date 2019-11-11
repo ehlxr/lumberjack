@@ -107,12 +107,18 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// BackupTimeFormat is append to back log files time format.
+	// The default time format is "2006-01-02".
+	BackupTimeFormat string `json:"backuptimeformat" yaml:"backuptimeformat"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
 
 	millCh    chan bool
 	startMill sync.Once
+
+	backTime time.Time
 }
 
 var (
@@ -120,7 +126,7 @@ var (
 	currentTime = time.Now
 
 	// os_Stat exists so it can be mocked out by tests.
-	os_Stat = os.Stat
+	osStat = os.Stat
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
@@ -183,9 +189,13 @@ func (l *Logger) close() error {
 // rotations outside of the normal rotation rules, such as in response to
 // SIGHUP.  After rotating, this initiates compression and removal of old log
 // files according to the configuration.
-func (l *Logger) Rotate() error {
+func (l *Logger) Rotate(backTime ...time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if backTime != nil && len(backTime) > 0 {
+		l.backTime = backTime[0]
+	}
+
 	return l.rotate()
 }
 
@@ -213,12 +223,12 @@ func (l *Logger) openNew() error {
 
 	name := l.filename()
 	mode := os.FileMode(0600)
-	info, err := os_Stat(name)
+	info, err := osStat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -244,18 +254,40 @@ func (l *Logger) openNew() error {
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
-func backupName(name string, local bool) string {
+func (l *Logger) backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
+
 	t := currentTime()
-	if !local {
+	if !l.backTime.IsZero() {
+		t = l.backTime
+	}
+	if !l.LocalTime {
 		t = t.UTC()
 	}
 
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	btf := backupTimeFormat
+	if l.BackupTimeFormat != "" {
+		btf = l.BackupTimeFormat
+	}
+
+	timestamp := t.Format(btf)
+	newname := filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+
+	return fileExists(newname, dir, prefix, timestamp, ext, 0)
+}
+
+func fileExists(name, dir, prefix, timestamp, ext string, nu int) string {
+	_, err := os.Stat(name)
+	if err == nil || os.IsExist(err) {
+		nu++
+		name = filepath.Join(dir, fmt.Sprintf("%s-%s_%d%s", prefix, timestamp, nu, ext))
+
+		return fileExists(name, dir, prefix, timestamp, ext, nu)
+	}
+	return name
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -265,7 +297,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
 
 	filename := l.filename()
-	info, err := os_Stat(filename)
+	info, err := osStat(filename)
 	if os.IsNotExist(err) {
 		return l.openNew()
 	}
@@ -376,7 +408,7 @@ func (l *Logger) millRunOnce() error {
 // millRun runs in a goroutine to manage post-rotation compression and removal
 // of old log files.
 func (l *Logger) millRun() {
-	for _ = range l.millCh {
+	for range l.millCh {
 		// what am I going to do, log this?
 		_ = l.millRunOnce()
 	}
@@ -402,7 +434,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("can't read log file directory: %s", err)
 	}
-	logFiles := []logInfo{}
+	var logFiles []logInfo
 
 	prefix, ext := l.prefixAndExt()
 
@@ -438,7 +470,11 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 		return time.Time{}, errors.New("mismatched extension")
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
-	return time.Parse(backupTimeFormat, ts)
+	btf := backupTimeFormat
+	if l.BackupTimeFormat != "" {
+		btf = l.BackupTimeFormat
+	}
+	return time.Parse(btf, ts)
 }
 
 // max returns the maximum size in bytes of log files before rolling.
@@ -465,6 +501,7 @@ func (l *Logger) prefixAndExt() (prefix, ext string) {
 
 // compressLogFile compresses the given log file, removing the
 // uncompressed log file if successful.
+//noinspection GoUnhandledErrorResult
 func compressLogFile(src, dst string) (err error) {
 	f, err := os.Open(src)
 	if err != nil {
@@ -472,7 +509,7 @@ func compressLogFile(src, dst string) (err error) {
 	}
 	defer f.Close()
 
-	fi, err := os_Stat(src)
+	fi, err := osStat(src)
 	if err != nil {
 		return fmt.Errorf("failed to stat log file: %v", err)
 	}
@@ -493,7 +530,7 @@ func compressLogFile(src, dst string) (err error) {
 
 	defer func() {
 		if err != nil {
-			os.Remove(dst)
+			_ = os.Remove(dst)
 			err = fmt.Errorf("failed to compress log file: %v", err)
 		}
 	}()
