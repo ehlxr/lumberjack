@@ -474,6 +474,8 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 	if l.BackupTimeFormat != "" {
 		btf = l.BackupTimeFormat
 	}
+	ts = ts[:len(l.BackupTimeFormat)]
+
 	return time.Parse(btf, ts)
 }
 
